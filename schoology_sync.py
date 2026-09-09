@@ -827,6 +827,7 @@ def save_attachment(
     course_dir: Path,
     state: State,
     *,
+    course_name: str,
     refresh: bool,
     dry_run: bool,
 ) -> str:
@@ -845,7 +846,8 @@ def save_attachment(
     folder_dir.mkdir(parents=True, exist_ok=True)
 
     if dry_run:
-        print(f"      WOULD DOWNLOAD: {' / '.join(attachment.folders + [attachment.display_name])}")
+        relative_name = " / ".join(attachment.folders + [attachment.display_name])
+        print(f"      WOULD DOWNLOAD: {course_name} → {relative_name}")
         return "dry-run"
 
     try:
@@ -860,6 +862,7 @@ def save_attachment(
                 time.sleep(10)
                 return save_attachment(
                     session, attachment, course_dir, state,
+                    course_name=course_name,
                     refresh=refresh, dry_run=dry_run
                 )
 
@@ -926,7 +929,8 @@ def save_attachment(
                 "updated": time.strftime("%Y-%m-%d %H:%M:%S"),
             })
 
-            print(f"      ↓ {dest.name} ({size / 1024:.1f} KB)")
+            relative_name = " / ".join(attachment.folders + [dest.name])
+            print(f"      ↓ NEW: {course_name} → {relative_name} ({size / 1024:.1f} KB)")
             return "downloaded"
 
     except Exception as exc:
@@ -1084,6 +1088,7 @@ def sync_course(
             a,
             course_dir,
             state,
+            course_name=course_name,
             refresh=refresh,
             dry_run=dry_run,
         )

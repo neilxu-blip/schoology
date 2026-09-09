@@ -1114,8 +1114,8 @@ def parse_args():
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path.cwd() / "Schoology",
-        help="Root download folder. Default: ./Schoology",
+        default=Path("/Users/lingyunxu/Library/CloudStorage/GoogleDrive-neilxu@gmail.com/My Drive/Schoology Basis 2026-27"),
+        help="Root download folder. Default: Google Drive / Schoology Basis 2026-27",
     )
     parser.add_argument(
         "--base-url",

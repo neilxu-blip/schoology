@@ -1,0 +1,4 @@
+.schoology_sync/
+.venv/
+__pycache__/
+.DS_Store

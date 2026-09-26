@@ -8,10 +8,10 @@ course/folder hierarchy as closely as possible.
 
 Authentication:
 - Uses a persistent Playwright Chromium profile per student/profile.
-- If a local QR image is configured, Chromium presents it through a file-backed
-  synthetic QR video stream so Schoology can scan it automatically.
-- Otherwise the browser remains open for normal manual QR scanning.
-- QR images remain local under .schoology_sync/ and should never be committed.
+- Replays a locally learned Schoology QR-auth request before opening the QR page.
+- The QR/camera page is opened only when automatic authentication fails or
+  --manual-qr is requested.
+- Learned QR-auth data remains local under .schoology_sync/ and must never be committed.
 
 Examples:
     python schoology_sync.py hanna
@@ -28,11 +28,11 @@ Requires:
 from __future__ import annotations
 
 import argparse
-import base64
 import hashlib
 import json
 import os
 import random
+import shutil
 import re
 import sys
 import time
@@ -214,212 +214,6 @@ def sleep_with_jitter(base_seconds: float, jitter_seconds: float = 0.0) -> None:
     time.sleep(delay)
 
 
-def resolve_qr_image(
-    explicit_path: Path | None,
-    script_dir: Path,
-    profile_name: str,
-    manual_qr: bool,
-) -> Path | None:
-    """
-    Resolve an optional QR image.
-
-    If --qr-image is not supplied, auto-detect from the project-local folder:
-      qr/<profile>.png|jpg|jpeg|webp
-
-    Example:
-      /Users/lingyunxu/Documents/git_projects/schoology/qr/hanna.png
-      /Users/lingyunxu/Documents/git_projects/schoology/qr/matthew.png
-    """
-    if manual_qr:
-        return None
-
-    if explicit_path is not None:
-        p = explicit_path.expanduser().resolve()
-        if not p.is_file():
-            raise FileNotFoundError(f"QR image not found: {p}")
-        return p
-
-    qr_dir = script_dir / "qr"
-    for ext in (".png", ".jpg", ".jpeg", ".webp"):
-        p = qr_dir / f"{profile_name}{ext}"
-        if p.is_file():
-            return p.resolve()
-    return None
-
-
-def build_qr_fake_camera_y4m(qr_image: Path, destination: Path) -> Path:
-    """
-    Turn a QR screenshot/photo into a one-frame Y4M video for Chromium's
-    file-backed synthetic QR video stream. Chromium loops the file continuously.
-
-    Pillow is imported only when this feature is used so existing manual-login
-    installs keep working until the user enables automatic QR login.
-    """
-    try:
-        from PIL import Image, ImageOps
-    except ImportError as exc:
-        raise RuntimeError(
-            "Automatic QR login needs Pillow. Install it with: uv pip install pillow\n"
-            "or: pip install pillow"
-        ) from exc
-
-    frame_w, frame_h = 1280, 720
-
-    with Image.open(qr_image) as im:
-        # Flatten transparency onto white. QR scanners strongly prefer clean white
-        # quiet zones around the code.
-        im = im.convert("RGBA")
-        white = Image.new("RGBA", im.size, "white")
-        white.alpha_composite(im)
-        im = white.convert("RGB")
-
-        # Keep the QR/screenshot large but leave a generous white border.
-        fitted = ImageOps.contain(
-            im,
-            (int(frame_w * 0.78), int(frame_h * 0.86)),
-            method=Image.Resampling.LANCZOS,
-        )
-        canvas = Image.new("RGB", (frame_w, frame_h), "white")
-        x = (frame_w - fitted.width) // 2
-        y = (frame_h - fitted.height) // 2
-        canvas.paste(fitted, (x, y))
-
-    ycbcr = canvas.convert("YCbCr")
-    y_plane, cb_plane, cr_plane = ycbcr.split()
-    cb_plane = cb_plane.resize((frame_w // 2, frame_h // 2), Image.Resampling.BOX)
-    cr_plane = cr_plane.resize((frame_w // 2, frame_h // 2), Image.Resampling.BOX)
-
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    tmp = destination.with_suffix(destination.suffix + ".tmp")
-    with tmp.open("wb") as f:
-        f.write(
-            f"YUV4MPEG2 W{frame_w} H{frame_h} F5:1 Ip A1:1 C420jpeg\n".encode("ascii")
-        )
-        f.write(b"FRAME\n")
-        f.write(y_plane.tobytes())
-        f.write(cb_plane.tobytes())
-        f.write(cr_plane.tobytes())
-    tmp.replace(destination)
-    return destination.resolve()
-
-
-def build_synthetic_qr_camera_script(qr_image: Path) -> str:
-    """
-    Minimal automatic QR camera shim.
-
-    Only navigator.mediaDevices.getUserMedia() is replaced. We intentionally do
-    not spoof Permissions API, enumerateDevices(), or any other browser API,
-    because those broader overrides can interfere with Schoology's QR page.
-    """
-    suffix = qr_image.suffix.lower()
-    mime = {
-        ".png": "image/png",
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".webp": "image/webp",
-    }.get(suffix)
-    if mime is None:
-        raise ValueError(f"Unsupported QR image type: {qr_image}")
-
-    encoded = base64.b64encode(qr_image.read_bytes()).decode("ascii")
-    data_url = f"data:{mime};base64,{encoded}"
-    data_url_js = json.dumps(data_url)
-
-    return f"""
-(() => {{
-  const QR_DATA_URL = {data_url_js};
-
-  async function makeQrStream() {{
-    const canvas = document.createElement('canvas');
-    canvas.width = 1280;
-    canvas.height = 720;
-
-    const ctx = canvas.getContext('2d', {{alpha: false}});
-    ctx.fillStyle = 'white';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    ctx.imageSmoothingEnabled = false;
-
-    const img = new Image();
-    await new Promise((resolve, reject) => {{
-      img.onload = resolve;
-      img.onerror = () => reject(new Error('Could not load saved QR image'));
-      img.src = QR_DATA_URL;
-    }});
-
-    // Center the QR with a generous white quiet zone around it.
-    const maxW = Math.floor(canvas.width * 0.66);
-    const maxH = Math.floor(canvas.height * 0.84);
-    const scale = Math.min(maxW / img.naturalWidth, maxH / img.naturalHeight);
-    const w = Math.max(1, Math.round(img.naturalWidth * scale));
-    const h = Math.max(1, Math.round(img.naturalHeight * scale));
-    const x = Math.round((canvas.width - w) / 2);
-    const y = Math.round((canvas.height - h) / 2);
-    ctx.drawImage(img, x, y, w, h);
-
-    const stream = canvas.captureStream(10);
-
-    // Keep frames flowing even though the QR itself is static.
-    let tick = false;
-    setInterval(() => {{
-      tick = !tick;
-      ctx.fillStyle = tick ? 'rgb(255,255,255)' : 'rgb(254,254,254)';
-      ctx.fillRect(0, 0, 3, 3);
-    }}, 100);
-
-    return stream;
-  }}
-
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {{
-    return;
-  }}
-
-  const original = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
-
-  Object.defineProperty(navigator.mediaDevices, 'getUserMedia', {{
-    configurable: true,
-    value: async (constraints) => {{
-      // Only substitute requests that ask for video.
-      if (constraints && constraints.video === false) {{
-        return original(constraints);
-      }}
-      return makeQrStream();
-    }}
-  }});
-}})();
-"""
-
-
-def install_synthetic_qr_camera(page: Page, qr_image: Path) -> None:
-    """
-    Install the minimal QR stream shim before the QR login page loads.
-    """
-    page.add_init_script(script=build_synthetic_qr_camera_script(qr_image))
-
-
-def save_qr_login_debug(page: Page, debug_dir: Path, profile_name: str) -> None:
-    """Save screenshot/HTML/URL when automatic QR login fails."""
-    debug_dir.mkdir(parents=True, exist_ok=True)
-    base = debug_dir / f"{profile_name}_qr_login"
-
-    try:
-        page.screenshot(path=str(base.with_suffix(".png")), full_page=True)
-    except Exception:
-        pass
-
-    try:
-        base.with_suffix(".html").write_text(page.content(), encoding="utf-8")
-    except Exception:
-        pass
-
-    try:
-        base.with_suffix(".txt").write_text(
-            json.dumps({"url": page.url, "title": page.title()}, indent=2),
-            encoding="utf-8",
-        )
-    except Exception:
-        pass
-
-
 def build_requests_session(context: BrowserContext, page: Page) -> requests.Session:
     session = requests.Session()
     try:
@@ -495,168 +289,6 @@ def find_authenticated_page(context: BrowserContext) -> Page | None:
         except Exception:
             continue
     return None
-
-
-
-def force_camera_permission(context: BrowserContext, page: Page | None = None, origin: str | None = None) -> None:
-    """
-    Aggressively grant camera permission for the automation context.
-
-    Why both Playwright permissions and CDP?
-    - Playwright's camera permission is the normal supported route.
-    - Chromium's CDP 'videoCapture' permission is an additional fallback that
-      helps with persistent profiles that previously remembered a blocked site.
-    """
-    try:
-        # Remove Playwright permission overrides left from an earlier run.
-        context.clear_permissions()
-    except Exception:
-        pass
-
-    # Grant camera to all origins in this automation context. Schoology's QR
-    # scanner may initialize through embedded content, so origin-only permission
-    # is unnecessarily fragile here.
-    try:
-        context.grant_permissions(["camera"])
-    except Exception as exc:
-        eprint(f"WARNING: Playwright could not globally grant camera permission: {exc}")
-
-    if page is None:
-        return
-
-    try:
-        cdp = context.new_cdp_session(page)
-
-        # Grant video capture globally in Chromium.
-        try:
-            cdp.send(
-                "Browser.setPermission",
-                {
-                    "permission": {"name": "videoCapture"},
-                    "setting": "granted",
-                },
-            )
-        except Exception:
-            pass
-
-        # Also grant the exact QR-page origin when known.
-        if origin:
-            try:
-                cdp.send(
-                    "Browser.setPermission",
-                    {
-                        "permission": {"name": "videoCapture"},
-                        "setting": "granted",
-                        "origin": origin,
-                    },
-                )
-            except Exception:
-                pass
-
-        try:
-            cdp.detach()
-        except Exception:
-            pass
-    except Exception:
-        # The launch flags still provide an independent auto-accept path.
-        pass
-
-
-def camera_self_test(page: Page) -> dict:
-    """
-    Ask Chromium for one video frame/stream before Schoology's own scanner starts.
-    With the synthetic-stream flags this should use the saved QR Y4M file, not the
-    physical webcam.
-    """
-    js = r"""
-    async () => {
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        return {ok: false, name: "MediaDevicesUnavailable",
-                message: "navigator.mediaDevices.getUserMedia is unavailable"};
-      }
-
-      let permission = "unknown";
-      try {
-        if (navigator.permissions && navigator.permissions.query) {
-          const p = await navigator.permissions.query({name: "camera"});
-          permission = p.state || "unknown";
-        }
-      } catch (_) {}
-
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          video: true,
-          audio: false
-        });
-
-        const tracks = stream.getVideoTracks();
-        const label = tracks.length ? tracks[0].label : "";
-        for (const t of stream.getTracks()) t.stop();
-
-        return {ok: true, permission, label};
-      } catch (e) {
-        return {
-          ok: false,
-          permission,
-          name: e && e.name ? e.name : "UnknownError",
-          message: e && e.message ? e.message : String(e)
-        };
-      }
-    }
-    """
-    try:
-        return page.evaluate(js)
-    except Exception as exc:
-        return {
-            "ok": False,
-            "name": type(exc).__name__,
-            "message": str(exc),
-            "permission": "unknown",
-        }
-
-
-def prepare_automatic_qr_camera(page: Page, qr_url: str) -> None:
-    """
-    Make sure the synthetic QR video stream is usable before allowing Schoology's scanner
-    to initialize. If the QR page initially rendered its "Camera is blocked"
-    state, reload it after permission has been forced.
-    """
-    context = page.context
-    p = urlsplit(qr_url)
-    qr_origin = f"{p.scheme}://{p.netloc}"
-
-    force_camera_permission(context, page, qr_origin)
-
-    # Reload after permission changes so Schoology does not keep an error state
-    # from an earlier getUserMedia() call made during initial page load.
-    try:
-        page.reload(wait_until="domcontentloaded", timeout=45_000)
-        page.wait_for_timeout(800)
-    except Exception:
-        pass
-
-    result = camera_self_test(page)
-
-    if result.get("ok"):
-        label = result.get("label") or "fake video device"
-        print(f"✓ Fake camera is available to Chromium ({label}).")
-
-        # Our self-test stopped its stream. Reload once more so Schoology's QR
-        # scanner starts fresh and owns the synthetic-stream stream.
-        try:
-            page.reload(wait_until="domcontentloaded", timeout=45_000)
-            page.wait_for_timeout(800)
-        except Exception:
-            pass
-        return
-
-    raise RuntimeError(
-        "Chromium still cannot access the camera stream. "
-        f"Permission={result.get('permission', 'unknown')}; "
-        f"{result.get('name', 'CameraError')}: {result.get('message', '')}. "
-        "On macOS, also check System Settings > Privacy & Security > Camera. "
-        "If Chromium/Google Chrome is listed there, allow camera access and rerun."
-    )
 
 
 
@@ -811,49 +443,40 @@ def _is_authenticated_context(context: BrowserContext, base_url: str) -> bool:
     return authenticated
 
 
-def _replay_one_qr_request(page: Page, item: dict) -> dict:
+def _replay_one_qr_request(context: BrowserContext, item: dict) -> dict:
     """
-    Replay a learned request inside the Schoology page so current anonymous
-    cookies, CSRF cookies, redirects, and browser networking behavior are used.
+    Replay a learned Schoology authentication request through BrowserContext.request.
+
+    BrowserContext.request shares the browser context's cookie jar, so this can
+    establish a logged-in browser session without rendering Schoology's QR/camera
+    page at all.
     """
-    payload = {
-        "url": item.get("url"),
-        "method": item.get("method", "GET"),
+    method = (item.get("method") or "GET").upper()
+    body = item.get("post_data")
+    kwargs = {
+        "method": method,
         "headers": item.get("headers") or {},
-        "body": item.get("post_data"),
+        "timeout": 30_000,
+        "fail_on_status_code": False,
+        "max_redirects": 20,
     }
 
-    return page.evaluate(
-        r"""async (p) => {
-            try {
-                const opts = {
-                    method: p.method || "GET",
-                    credentials: "include",
-                    redirect: "follow",
-                    headers: p.headers || {}
-                };
+    if body is not None and method not in {"GET", "HEAD"}:
+        kwargs["data"] = body
 
-                if (p.body !== null && p.body !== undefined &&
-                    !["GET", "HEAD"].includes((p.method || "GET").toUpperCase())) {
-                    opts.body = p.body;
-                }
-
-                const r = await fetch(p.url, opts);
-                return {
-                    ok: r.ok,
-                    status: r.status,
-                    finalUrl: r.url
-                };
-            } catch (e) {
-                return {
-                    ok: false,
-                    status: 0,
-                    error: e && e.message ? e.message : String(e)
-                };
-            }
-        }""",
-        payload,
-    )
+    try:
+        response = context.request.fetch(item.get("url"), **kwargs)
+        return {
+            "ok": response.ok,
+            "status": response.status,
+            "finalUrl": response.url,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": 0,
+            "error": str(exc),
+        }
 
 
 def try_learned_qr_login(
@@ -873,13 +496,13 @@ def try_learned_qr_login(
 
     for index, item in enumerate(requests_to_try, start=1):
         try:
-            result = _replay_one_qr_request(page, item)
+            result = _replay_one_qr_request(page.context, item)
         except Exception as exc:
             eprint(f"  saved QR request {index} could not be replayed: {exc}")
             continue
 
         # Give Schoology a moment to set session cookies / finish redirects.
-        page.wait_for_timeout(1200)
+        time.sleep(1.2)
 
         if _is_authenticated_context(page.context, base_url):
             print("✓ Saved QR login succeeded.")
@@ -995,14 +618,18 @@ def ensure_login(
 
     Login order:
       1. Existing persistent browser session.
-      2. Previously learned Schoology QR-auth request.
-      3. One manual QR scan, while learning the successful request for later.
+      2. Previously learned Schoology QR-auth request WITHOUT opening QR/camera UI.
+      3. Only if automatic auth fails: open the normal QR page for manual relearning.
     """
     context = page.context
     print("\nChecking Schoology login...")
 
     try:
-        page.goto(base_url.rstrip("/") + "/home", wait_until="domcontentloaded", timeout=45_000)
+        page.goto(
+            base_url.rstrip("/") + "/home",
+            wait_until="domcontentloaded",
+            timeout=45_000,
+        )
     except PlaywrightTimeoutError:
         pass
 
@@ -1013,26 +640,41 @@ def ensure_login(
     else:
         print("Schoology requires login.")
 
-        # Load the normal QR page first. This establishes any anonymous cookies
-        # Schoology expects before the learned login request is replayed.
-        qr_url = base_url.rstrip("/") + QR_PATH
-        try:
-            page.goto(qr_url, wait_until="domcontentloaded", timeout=45_000)
-            page.wait_for_timeout(700)
-        except PlaywrightTimeoutError:
-            pass
-
         replayed = False
+
         if not force_manual_qr and qr_auth_path.exists():
+            # Prime any anonymous cookies/CSRF state Schoology's QR endpoint may
+            # expect, but do it as an HTTP request so no camera page is rendered.
+            try:
+                context.request.get(
+                    base_url.rstrip("/") + QR_PATH,
+                    timeout=15_000,
+                    max_redirects=10,
+                    fail_on_status_code=False,
+                )
+            except Exception:
+                pass
+
             replayed = try_learned_qr_login(page, base_url, qr_auth_path)
 
         if replayed:
             authenticated, final_url = browser_session_authenticated(context, base_url)
         else:
-            final_url = manual_qr_login_and_learn(page, base_url, qr_auth_path)
+            if qr_auth_path.exists() and not force_manual_qr:
+                print(
+                    "Automatic QR authentication failed; opening the QR page "
+                    "for one manual relearning scan."
+                )
+            final_url = manual_qr_login_and_learn(
+                page,
+                base_url,
+                qr_auth_path,
+            )
 
         if not _is_authenticated_context(context, base_url):
-            raise RuntimeError("Schoology QR authentication did not create a valid session.")
+            raise RuntimeError(
+                "Schoology QR authentication did not create a valid session."
+            )
 
     # Normalize onto authenticated Schoology home.
     target_origin = base_url.rstrip("/")
@@ -1042,13 +684,21 @@ def ensure_login(
             target_origin = f"{parsed.scheme}://{parsed.netloc}"
 
     try:
-        page.goto(target_origin + "/home", wait_until="domcontentloaded", timeout=45_000)
+        page.goto(
+            target_origin + "/home",
+            wait_until="domcontentloaded",
+            timeout=45_000,
+        )
         page.wait_for_timeout(700)
     except PlaywrightTimeoutError:
         pass
 
     if logged_out(page):
-        page.goto(base_url.rstrip("/") + "/home", wait_until="domcontentloaded", timeout=45_000)
+        page.goto(
+            base_url.rstrip("/") + "/home",
+            wait_until="domcontentloaded",
+            timeout=45_000,
+        )
         page.wait_for_timeout(500)
 
     if logged_out(page):
@@ -1539,16 +1189,41 @@ def save_attachment(
     key = state_key(attachment)
     old = state.get(key)
 
-    if old and not refresh:
-        old_path = Path(old.get("path", ""))
-        if old_path.exists():
-            print(f"      ✓ {old_path.name}")
-            return "skipped"
-
     folder_dir = course_dir
     for folder in attachment.folders:
         folder_dir = folder_dir / sanitize_component(folder)
     folder_dir.mkdir(parents=True, exist_ok=True)
+
+    # State is shared between Macs. Prefer the recorded absolute path when it
+    # exists, but repair it against this Mac's Google Drive tree when needed.
+    if old:
+        old_path = Path(old.get("path", "")) if old.get("path") else None
+
+        if old_path is None or not old_path.exists():
+            candidate = None
+
+            relative_path = old.get("relative_path")
+            if relative_path:
+                candidate = course_dir.parent / Path(relative_path)
+            elif old_path is not None and old_path.name:
+                # Legacy v1.x state has only an absolute path. Course/folder data
+                # are already known here, so reconstruct the path on this Mac.
+                candidate = folder_dir / old_path.name
+
+            if candidate is not None and candidate.exists():
+                old["path"] = str(candidate.resolve())
+                try:
+                    old["relative_path"] = str(
+                        candidate.resolve().relative_to(course_dir.parent.resolve())
+                    )
+                except Exception:
+                    pass
+                state.set(key, old)
+                old_path = candidate
+
+        if not refresh and old_path is not None and old_path.exists():
+            print(f"      ✓ {old_path.name}")
+            return "skipped"
 
     if dry_run:
         relative_name = " / ".join(attachment.folders + [attachment.display_name])
@@ -1624,8 +1299,16 @@ def save_attachment(
 
             tmp.replace(dest)
 
+            try:
+                relative_path = str(
+                    dest.resolve().relative_to(course_dir.parent.resolve())
+                )
+            except Exception:
+                relative_path = None
+
             state.set(key, {
                 "path": str(dest.resolve()),
+                "relative_path": relative_path,
                 "sha256": digest,
                 "size": size,
                 "source_page": attachment.source_page,
@@ -1876,18 +1559,9 @@ def parse_args():
         help="Playwright slow motion in milliseconds, useful for debugging.",
     )
     parser.add_argument(
-        "--qr-image",
-        type=Path,
-        default=None,
-        help=(
-            "Deprecated compatibility option. v1.9 learns the QR authentication "
-            "request from one normal manual scan instead of emulating a camera."
-        ),
-    )
-    parser.add_argument(
         "--manual-qr",
         action="store_true",
-        help="Force a real-camera QR scan and refresh the locally learned QR login request.",
+        help="Force a real-camera QR scan and refresh the local learned QR-auth request.",
     )
     parser.add_argument(
         "--click-delay",
@@ -1950,8 +1624,8 @@ def main():
     script_dir = Path(__file__).resolve().parent
     work_dir = script_dir / ".schoology_sync"
     profile_dir = work_dir / "profiles" / profile_name
-    state_path = work_dir / "state" / f"{profile_name}.json"
     debug_dir = work_dir / "debug" / profile_name
+    legacy_state_path = work_dir / "state" / f"{profile_name}.json"
 
     for name, value in (
         ("--click-delay", args.click_delay),
@@ -1964,12 +1638,44 @@ def main():
 
     qr_auth_path = work_dir / "qr_auth" / f"{profile_name}.json"
 
-    output_root = args.output.expanduser().resolve() / sanitize_component(args.profile.title())
+    archive_root = args.output.expanduser().resolve()
+    output_root = archive_root / sanitize_component(args.profile.title())
     output_root.mkdir(parents=True, exist_ok=True)
+
+    # Keep shared sync state OUTSIDE the shareable Schoology archive folder.
+    # Example:
+    #   My Drive/
+    #     Schoology Basis 2026-27/   <- safe to share
+    #     Schoology Sync State/      <- keep private
+    #
+    # All Macs using the same Google Drive see this common state.
+    shared_state_dir = archive_root.parent / "Schoology Sync State"
+    shared_state_dir.mkdir(parents=True, exist_ok=True)
+    state_path = shared_state_dir / f"{profile_name}.json"
+
+    # v2.0 stored state inside the Schoology archive. Move that state out of
+    # the shareable folder automatically on first run.
+    old_shared_state_dir = archive_root / ".schoology_state"
+    old_shared_state_path = old_shared_state_dir / f"{profile_name}.json"
+
+    if not state_path.exists() and old_shared_state_path.exists():
+        shutil.copy2(old_shared_state_path, state_path)
+        try:
+            old_shared_state_path.unlink()
+            old_shared_state_dir.rmdir()
+        except OSError:
+            pass
+        print(f"Migrated shared state to private folder: {state_path}")
+
+    # Automatic one-time migration from v1.x's machine-local state.
+    if not state_path.exists() and legacy_state_path.exists():
+        shutil.copy2(legacy_state_path, state_path)
+        print(f"Migrated local state to private shared state: {state_path}")
 
     print("Schoology Sync")
     print(f"Profile : {args.profile}")
     print(f"Output  : {output_root}")
+    print(f"State   : {state_path} (shared private folder)")
     print(f"Browser : persistent Chromium profile at {profile_dir}")
     if qr_auth_path.exists() and not args.manual_qr:
         print(f"QR login: learned automatic request ({qr_auth_path})")

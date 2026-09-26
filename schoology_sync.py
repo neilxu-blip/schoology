@@ -39,7 +39,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
-from urllib.parse import urljoin, urlsplit, urlunsplit, unquote
+from urllib.parse import urljoin, urlsplit, urlunsplit, unquote, unquote_plus
 
 import requests
 from bs4 import BeautifulSoup
@@ -117,6 +117,16 @@ def sanitize_component(name: str, fallback: str = "Untitled") -> str:
         else:
             name = name[:110].rstrip()
     return name
+
+
+
+def pretty_download_name(value: str) -> str:
+    """Make URL-encoded Schoology filenames easier to read in console summaries."""
+    try:
+        return unquote_plus(value)
+    except Exception:
+        return value
+
 
 
 def canonical_url(url: str) -> str:
@@ -1183,6 +1193,7 @@ def save_attachment(
     state: State,
     *,
     course_name: str,
+    new_downloads: list[dict],
     refresh: bool,
     dry_run: bool,
 ) -> str:
@@ -1244,6 +1255,7 @@ def save_attachment(
                 return save_attachment(
                     session, attachment, course_dir, state,
                     course_name=course_name,
+                    new_downloads=new_downloads,
                     refresh=refresh, dry_run=dry_run
                 )
 
@@ -1319,7 +1331,18 @@ def save_attachment(
             })
 
             relative_name = " / ".join(attachment.folders + [dest.name])
-            print(f"      ↓ NEW: {course_name} → {relative_name} ({size / 1024:.1f} KB)")
+            size_kb = size / 1024
+            print(f"      ↓ NEW: {course_name} → {relative_name} ({size_kb:.1f} KB)")
+
+            new_downloads.append({
+                "course": course_name,
+                "relative_name": relative_name,
+                "display_name": pretty_download_name(relative_name),
+                "size": size,
+                "size_kb": size_kb,
+                "path": str(dest.resolve()),
+            })
+
             return "downloaded"
 
     except Exception as exc:
@@ -1399,6 +1422,7 @@ def sync_course(
     output_root: Path,
     state: State,
     *,
+    new_downloads: list[dict],
     refresh: bool,
     dry_run: bool,
     debug_dir: Path,
@@ -1482,6 +1506,7 @@ def sync_course(
             course_dir,
             state,
             course_name=course_name,
+            new_downloads=new_downloads,
             refresh=refresh,
             dry_run=dry_run,
         )
@@ -1740,6 +1765,7 @@ def main():
                 print(f"  • {c.name}  [{c.course_id}]")
 
             totals = {"downloaded": 0, "skipped": 0, "errors": 0, "not_file": 0}
+            new_downloads: list[dict] = []
 
             for course in courses:
                 try:
@@ -1749,6 +1775,7 @@ def main():
                         course,
                         output_root,
                         state,
+                        new_downloads=new_downloads,
                         refresh=args.refresh,
                         dry_run=args.dry_run,
                         debug_dir=debug_dir,
@@ -1770,6 +1797,26 @@ def main():
                         pass
 
             state.save()
+
+            print()
+            print("=" * 72)
+            print(f"NEW DOWNLOADS ({len(new_downloads)})")
+            print("=" * 72)
+
+            if new_downloads:
+                current_course = None
+                for item in new_downloads:
+                    if item["course"] != current_course:
+                        if current_course is not None:
+                            print()
+                        current_course = item["course"]
+                        print(f"{current_course}:")
+                    print(
+                        f"  • {item['display_name']} "
+                        f"({item['size_kb']:.1f} KB)"
+                    )
+            else:
+                print("No new files were downloaded.")
 
             print()
             print("=" * 72)

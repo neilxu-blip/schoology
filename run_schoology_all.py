@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Run Schoology sync for Hanna + Matthew and send one email summary when needed.
+Run Schoology sync for Hanna + Matthew and send tailored email summaries.
 
 Normal scheduled run:
     python run_schoology_all.py
@@ -12,14 +12,21 @@ Test email without syncing Schoology:
     python run_schoology_all.py --test-email
 
 Email behavior:
-- No email when both syncs succeed and there are zero new files.
-- One combined email when new files are downloaded.
-- One alert email when either sync exits with an error, even if there are no new files.
+- Parent gets one combined Hanna + Matthew summary when there are new files.
+- Hanna gets only Hanna's new-file summary.
+- Matthew gets only Matthew's new-file summary.
+- A child gets no email when that child has zero new files.
+- Parent gets sync-error alerts; children do not get error/debug emails.
+- No email at all when both syncs succeed and there are zero new files.
 
 Secrets:
 - Gmail App Password is stored in macOS Keychain.
 - Non-secret sender/recipient settings live under .schoology_sync/email_config.json.
 - .schoology_sync/ must remain in .gitignore.
+
+Backward compatibility:
+- Existing configs with "recipient" continue to work; that value becomes the
+  parent recipient until "parent_recipient" is added.
 """
 
 from __future__ import annotations
@@ -48,10 +55,24 @@ DEFAULT_SMTP_PORT = 465
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Run Hanna + Matthew Schoology sync and email new-file summaries.")
-    p.add_argument("--setup-email", action="store_true", help="Configure sender/recipient and store Gmail App Password in macOS Keychain.")
-    p.add_argument("--test-email", action="store_true", help="Send a test email and exit without running Schoology.")
-    p.add_argument("--no-email", action="store_true", help="Run both syncs but suppress email notifications.")
+    p = argparse.ArgumentParser(
+        description="Run Hanna + Matthew Schoology sync and email tailored new-file summaries."
+    )
+    p.add_argument(
+        "--setup-email",
+        action="store_true",
+        help="Configure sender/recipients and store Gmail App Password in macOS Keychain.",
+    )
+    p.add_argument(
+        "--test-email",
+        action="store_true",
+        help="Send test emails to configured recipients and exit without running Schoology.",
+    )
+    p.add_argument(
+        "--no-email",
+        action="store_true",
+        help="Run both syncs but suppress email notifications.",
+    )
     return p.parse_args()
 
 
@@ -66,11 +87,15 @@ def read_config() -> dict:
 def keychain_set(account: str, password: str) -> None:
     subprocess.run(
         [
-            "security", "add-generic-password",
+            "security",
+            "add-generic-password",
             "-U",
-            "-s", KEYCHAIN_SERVICE,
-            "-a", account,
-            "-w", password,
+            "-s",
+            KEYCHAIN_SERVICE,
+            "-a",
+            account,
+            "-w",
+            password,
         ],
         check=True,
     )
@@ -79,9 +104,12 @@ def keychain_set(account: str, password: str) -> None:
 def keychain_get(account: str) -> str:
     result = subprocess.run(
         [
-            "security", "find-generic-password",
-            "-s", KEYCHAIN_SERVICE,
-            "-a", account,
+            "security",
+            "find-generic-password",
+            "-s",
+            KEYCHAIN_SERVICE,
+            "-a",
+            account,
             "-w",
         ],
         check=True,
@@ -102,10 +130,27 @@ def setup_email() -> None:
             existing = {}
 
     default_sender = existing.get("sender", "neilxu@gmail.com")
-    default_recipient = existing.get("recipient", default_sender)
+    default_parent = existing.get(
+        "parent_recipient",
+        existing.get("recipient", default_sender),
+    )
+    default_hanna = existing.get("hanna_recipient", "")
+    default_matthew = existing.get("matthew_recipient", "")
 
     sender = input(f"Gmail sender [{default_sender}]: ").strip() or default_sender
-    recipient = input(f"Notification recipient [{default_recipient}]: ").strip() or default_recipient
+    parent = input(f"Parent recipient [{default_parent}]: ").strip() or default_parent
+
+    hanna_prompt = f"Hanna recipient [{default_hanna}]: " if default_hanna else "Hanna recipient (blank = disabled): "
+    matthew_prompt = (
+        f"Matthew recipient [{default_matthew}]: "
+        if default_matthew
+        else "Matthew recipient (blank = disabled): "
+    )
+
+    entered_hanna = input(hanna_prompt).strip()
+    entered_matthew = input(matthew_prompt).strip()
+    hanna = entered_hanna or default_hanna
+    matthew = entered_matthew or default_matthew
 
     print("Enter a Google App Password for the sender account.")
     print("The password is stored in macOS Keychain and is not written to the project files.")
@@ -117,9 +162,11 @@ def setup_email() -> None:
 
     config = {
         "sender": sender,
-        "recipient": recipient,
-        "smtp_host": DEFAULT_SMTP_HOST,
-        "smtp_port": DEFAULT_SMTP_PORT,
+        "parent_recipient": parent,
+        "hanna_recipient": hanna,
+        "matthew_recipient": matthew,
+        "smtp_host": existing.get("smtp_host", DEFAULT_SMTP_HOST),
+        "smtp_port": int(existing.get("smtp_port", DEFAULT_SMTP_PORT)),
     }
     CONFIG_PATH.write_text(json.dumps(config, indent=2), encoding="utf-8")
     try:
@@ -131,15 +178,24 @@ def setup_email() -> None:
     print(f"Gmail App Password saved in macOS Keychain service: {KEYCHAIN_SERVICE}")
 
 
-def send_email(subject: str, body: str) -> None:
+def split_recipients(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [x.strip() for x in value.split(",") if x.strip()]
+
+
+def send_email_to(recipient_value: str, subject: str, body: str) -> None:
     config = read_config()
     sender = config["sender"]
-    recipient = config["recipient"]
+    recipients = split_recipients(recipient_value)
+    if not recipients:
+        return
+
     password = keychain_get(sender)
 
     msg = EmailMessage()
     msg["From"] = sender
-    msg["To"] = recipient
+    msg["To"] = ", ".join(recipients)
     msg["Subject"] = subject
     msg.set_content(body)
 
@@ -151,7 +207,16 @@ def send_email(subject: str, body: str) -> None:
         timeout=30,
     ) as smtp:
         smtp.login(sender, password)
-        smtp.send_message(msg)
+        smtp.send_message(msg, to_addrs=recipients)
+
+
+def parent_recipient(config: dict) -> str:
+    # Backward-compatible with the v2.3 "recipient" key.
+    return config.get("parent_recipient") or config.get("recipient") or config["sender"]
+
+
+def child_recipient(config: dict, profile: str) -> str:
+    return config.get(f"{profile}_recipient", "")
 
 
 def run_profile(profile: str) -> dict:
@@ -205,18 +270,64 @@ def human_size(size_bytes: int | float | None) -> str:
     return f"{n / 1024:.1f} KB"
 
 
-def build_email(results: list[dict]) -> tuple[str | None, str | None]:
+def profile_section(result: dict, include_no_new: bool = True) -> list[str]:
+    profile = result["profile"].title()
+    items = result.get("new_downloads", [])
+    exit_code = int(result.get("exit_code", 1))
+
+    lines = [f"{profile} — {len(items)} new file{'s' if len(items) != 1 else ''}"]
+
+    if exit_code != 0:
+        lines.append(f"WARNING: sync exited with code {exit_code}")
+
+    if items:
+        by_course = defaultdict(list)
+        for item in items:
+            by_course[item.get("course", "Unknown course")].append(item)
+
+        for course, course_items in by_course.items():
+            lines.append("")
+            lines.append(course)
+            for item in course_items:
+                display = (
+                    item.get("display_name")
+                    or item.get("relative_name")
+                    or "Unknown file"
+                )
+                lines.append(f"• {display} ({human_size(item.get('size'))})")
+    elif include_no_new:
+        lines.append("No new files.")
+
+    totals = result.get("totals") or {}
+    if totals:
+        lines.append("")
+        lines.append(
+            "Run totals: "
+            f"downloaded {totals.get('downloaded', 0)}, "
+            f"already had {totals.get('skipped', 0)}, "
+            f"errors {totals.get('errors', 0)}"
+        )
+
+    return lines
+
+
+def build_parent_email(results: list[dict]) -> tuple[str | None, str | None]:
     total_new = sum(len(r.get("new_downloads", [])) for r in results)
     failed = [r for r in results if int(r.get("exit_code", 1)) != 0]
 
-    # No news and no problems: deliberately stay silent.
     if total_new == 0 and not failed:
         return None, None
 
-    counts = {r["profile"].title(): len(r.get("new_downloads", [])) for r in results}
+    counts = {
+        r["profile"].title(): len(r.get("new_downloads", []))
+        for r in results
+    }
 
     if failed:
-        subject = f"[Schoology] Sync problem — {total_new} new file{'s' if total_new != 1 else ''}"
+        subject = (
+            f"[Schoology] Sync problem — "
+            f"{total_new} new file{'s' if total_new != 1 else ''}"
+        )
     else:
         subject = (
             f"[Schoology] {total_new} new file{'s' if total_new != 1 else ''} — "
@@ -225,47 +336,64 @@ def build_email(results: list[dict]) -> tuple[str | None, str | None]:
 
     lines = ["Schoology sync summary", ""]
 
-    for result in results:
-        profile = result["profile"].title()
-        items = result.get("new_downloads", [])
-        exit_code = int(result.get("exit_code", 1))
-
-        lines.append(f"{profile} — {len(items)} new file{'s' if len(items) != 1 else ''}")
-        if exit_code != 0:
-            lines.append(f"WARNING: sync exited with code {exit_code}")
-
-        if items:
-            by_course = defaultdict(list)
-            for item in items:
-                by_course[item.get("course", "Unknown course")].append(item)
-
-            for course, course_items in by_course.items():
-                lines.append("")
-                lines.append(course)
-                for item in course_items:
-                    display = item.get("display_name") or item.get("relative_name") or "Unknown file"
-                    lines.append(f"• {display} ({human_size(item.get('size'))})")
-        else:
-            lines.append("No new files.")
-
-        totals = result.get("totals") or {}
-        if totals:
-            lines.append("")
-            lines.append(
-                "Run totals: "
-                f"downloaded {totals.get('downloaded', 0)}, "
-                f"already had {totals.get('skipped', 0)}, "
-                f"errors {totals.get('errors', 0)}"
-            )
-
-        lines.append("")
-        lines.append("-" * 50)
-        lines.append("")
+    for i, result in enumerate(results):
+        lines.extend(profile_section(result))
+        if i != len(results) - 1:
+            lines.extend(["", "-" * 50, ""])
 
     if failed:
-        lines.append("At least one Schoology sync needs attention. Check the scheduled log on the Mac mini.")
+        lines.extend(
+            [
+                "",
+                "At least one Schoology sync needs attention.",
+                "Check the scheduled log on the Mac mini.",
+            ]
+        )
 
     return subject, "\n".join(lines).rstrip() + "\n"
+
+
+def build_child_email(result: dict) -> tuple[str | None, str | None]:
+    items = result.get("new_downloads", [])
+    if not items:
+        return None, None
+
+    profile = result["profile"].title()
+    count = len(items)
+    subject = f"[Schoology] {count} new file{'s' if count != 1 else ''} — {profile}"
+
+    lines = [
+        f"{profile} Schoology update",
+        "",
+    ]
+    # Do not include sync error/debug information in child emails.
+    clean_result = dict(result)
+    clean_result["exit_code"] = 0
+    lines.extend(profile_section(clean_result, include_no_new=False))
+
+    return subject, "\n".join(lines).rstrip() + "\n"
+
+
+def send_test_emails() -> None:
+    config = read_config()
+
+    parent = parent_recipient(config)
+    send_email_to(
+        parent,
+        "[Schoology] Parent test notification",
+        "Parent Schoology email notifications from the Mac mini are configured correctly.\n",
+    )
+    print(f"Parent test email sent to: {parent}")
+
+    for profile in PROFILES:
+        recipient = child_recipient(config, profile)
+        if recipient:
+            send_email_to(
+                recipient,
+                f"[Schoology] {profile.title()} test notification",
+                f"{profile.title()}'s Schoology email notifications from the Mac mini are configured correctly.\n",
+            )
+            print(f"{profile.title()} test email sent to: {recipient}")
 
 
 def main() -> int:
@@ -276,29 +404,55 @@ def main() -> int:
         return 0
 
     if args.test_email:
-        send_email(
-            "[Schoology] Test notification",
-            "Schoology email notifications from the Mac mini are configured correctly.\n",
-        )
-        print("Test email sent.")
+        send_test_emails()
         return 0
 
     results = [run_profile(profile) for profile in PROFILES]
 
-    subject, body = build_email(results)
-    if subject is None:
-        print("\nNo new files and no sync errors. No email sent.")
-        return 0
-
     if args.no_email:
         print("\nEmail suppressed by --no-email.")
-    else:
+        return 0 if all(int(r.get("exit_code", 1)) == 0 for r in results) else 1
+
+    config = read_config()
+
+    # Parent: combined summary and any error alerts.
+    parent_subject, parent_body = build_parent_email(results)
+    if parent_subject is not None:
         try:
-            send_email(subject, body)
-            print(f"\nEmail sent: {subject}")
+            parent = parent_recipient(config)
+            send_email_to(parent, parent_subject, parent_body)
+            print(f"\nParent email sent: {parent_subject}")
         except Exception as exc:
-            print(f"\nEMAIL ERROR: {exc}", file=sys.stderr)
+            print(f"\nPARENT EMAIL ERROR: {exc}", file=sys.stderr)
             return 3
+    else:
+        print("\nNo new files and no sync errors. No parent email sent.")
+
+    # Children: only their own new files, and only when they have something new.
+    child_email_error = False
+    for result in results:
+        profile = result["profile"]
+        recipient = child_recipient(config, profile)
+        if not recipient:
+            continue
+
+        subject, body = build_child_email(result)
+        if subject is None:
+            print(f"No new files for {profile.title()}. No child email sent.")
+            continue
+
+        try:
+            send_email_to(recipient, subject, body)
+            print(f"{profile.title()} email sent: {subject}")
+        except Exception as exc:
+            child_email_error = True
+            print(
+                f"{profile.title().upper()} EMAIL ERROR: {exc}",
+                file=sys.stderr,
+            )
+
+    if child_email_error:
+        return 3
 
     return 0 if all(int(r.get("exit_code", 1)) == 0 for r in results) else 1
 

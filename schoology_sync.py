@@ -1612,7 +1612,34 @@ def parse_args():
         default=DEFAULT_JITTER_SECONDS,
         help=f"Extra random delay added to pacing intervals. Default: 0-{DEFAULT_JITTER_SECONDS}s",
     )
+    parser.add_argument(
+        "--summary-json",
+        type=Path,
+        default=None,
+        help="Write this run's totals and newly downloaded files to a JSON file.",
+    )
     return parser.parse_args()
+
+
+def write_run_summary(path: Path | None, *, profile: str, totals: dict, new_downloads: list[dict], output_root: Path) -> None:
+    """Write a machine-readable summary for wrapper/scheduler integrations."""
+    if path is None:
+        return
+
+    payload = {
+        "profile": profile,
+        "completed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "totals": totals,
+        "new_downloads": new_downloads,
+        "output": str(output_root),
+    }
+
+    path = path.expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
 
 
 def explicit_courses(args, origin: str) -> list[Course]:
@@ -1830,6 +1857,14 @@ def main():
             if totals["errors"]:
                 print(f"Debug      : {debug_dir}")
             print()
+
+            write_run_summary(
+                args.summary_json,
+                profile=args.profile,
+                totals=totals,
+                new_downloads=new_downloads,
+                output_root=output_root,
+            )
 
             context.close()
             return 0 if totals["errors"] == 0 else 1

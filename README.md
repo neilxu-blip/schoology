@@ -410,6 +410,300 @@ them private and remove old snapshots when they are no longer needed.
 - `1`: at least one profile sync failed
 - `3`: an email operation failed
 
+## Scheduling with LaunchManager or macOS launchd
+
+On macOS, schedule this project as a **LaunchAgent**, not a LaunchDaemon. A
+LaunchAgent runs as the logged-in user and can access that user's Keychain and
+graphical session. Both are required by the current implementation: Gmail's App
+Password is stored in the user Keychain, and Playwright launches a visible
+Chromium browser.
+
+The examples below use this project location:
+
+```text
+/Users/lingyunxu/Documents/git_projects/schoology
+```
+
+Replace every path if the project is moved. launchd does not expand `~`, shell
+variables, or relative paths in plist settings, so use absolute paths.
+
+### 1. Verify the normal command and Python environment
+
+The scheduled job should call the virtual environment's Python executable
+directly. It does not need to run `source .venv/bin/activate`.
+
+Normal command with email enabled:
+
+```bash
+cd "/Users/lingyunxu/Documents/git_projects/schoology"
+"/Users/lingyunxu/Documents/git_projects/schoology/.venv/bin/python" \
+  "/Users/lingyunxu/Documents/git_projects/schoology/run_schoology_all.py"
+```
+
+Before scheduling, confirm that the same environment works interactively:
+
+```bash
+cd "/Users/lingyunxu/Documents/git_projects/schoology"
+"./.venv/bin/python" run_schoology_all.py --no-email
+"./.venv/bin/python" run_schoology_all.py --test-email
+```
+
+The first command tests both Schoology profiles without sending email. The
+second tests Gmail without running Schoology. Run both as the same macOS user
+that will own the LaunchAgent.
+
+### 2. Create a dedicated log folder
+
+Create a private directory before loading the job. launchd can create log files,
+but it does not create a missing parent directory.
+
+```bash
+mkdir -p "/Users/lingyunxu/Documents/git_projects/schoology/logs"
+chmod 700 "/Users/lingyunxu/Documents/git_projects/schoology/logs"
+```
+
+The example configuration writes normal output and error output separately:
+
+```text
+logs/schoology-sync.out.log
+logs/schoology-sync.err.log
+```
+
+These logs can contain student names, course names, local paths, and Schoology
+URLs. Keep them private, do not commit them, and periodically rotate or archive
+them so they do not grow indefinitely.
+
+### 3. LaunchManager field settings
+
+If using a graphical LaunchManager application, create a user LaunchAgent with
+the following values. Field names vary slightly between applications.
+
+| Setting | Value |
+| --- | --- |
+| Label | `com.neilxu.schoology-sync` |
+| Job type/domain | User LaunchAgent / logged-in GUI session |
+| Program | `/Users/lingyunxu/Documents/git_projects/schoology/.venv/bin/python` |
+| Argument 1 | `/Users/lingyunxu/Documents/git_projects/schoology/run_schoology_all.py` |
+| Working directory | `/Users/lingyunxu/Documents/git_projects/schoology` |
+| Standard output | `/Users/lingyunxu/Documents/git_projects/schoology/logs/schoology-sync.out.log` |
+| Standard error | `/Users/lingyunxu/Documents/git_projects/schoology/logs/schoology-sync.err.log` |
+| Run at load/login | Off, unless an immediate login-time run is desired |
+| Schedule | Calendar interval; example: every day at 6:00 AM |
+| Keep alive | Off |
+| Environment variable | `PYTHONUNBUFFERED=1` |
+
+Do not enter the entire command as the Program value. The Program is the
+virtual environment's Python executable, and the script path is its first
+argument. No shell is required.
+
+If LaunchManager offers only a shell-command field, use:
+
+```bash
+cd "/Users/lingyunxu/Documents/git_projects/schoology" && \
+  "/Users/lingyunxu/Documents/git_projects/schoology/.venv/bin/python" \
+  run_schoology_all.py
+```
+
+### 4. Equivalent LaunchAgent plist
+
+The equivalent native launchd file is:
+
+```text
+/Users/lingyunxu/Library/LaunchAgents/com.neilxu.schoology-sync.plist
+```
+
+Example configuration for a daily 6:00 AM run:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.neilxu.schoology-sync</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/lingyunxu/Documents/git_projects/schoology/.venv/bin/python</string>
+    <string>/Users/lingyunxu/Documents/git_projects/schoology/run_schoology_all.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/lingyunxu/Documents/git_projects/schoology</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>6</integer>
+    <key>Minute</key>
+    <integer>0</integer>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/Users/lingyunxu/Documents/git_projects/schoology/logs/schoology-sync.out.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/lingyunxu/Documents/git_projects/schoology/logs/schoology-sync.err.log</string>
+
+  <key>RunAtLoad</key>
+  <false/>
+
+  <key>KeepAlive</key>
+  <false/>
+
+  <key>LimitLoadToSessionType</key>
+  <string>Aqua</string>
+</dict>
+</plist>
+```
+
+Change `Hour` and `Minute` to the desired local time. This example uses the
+Mac's current time zone.
+
+Validate the file before loading it:
+
+```bash
+plutil -lint \
+  "/Users/lingyunxu/Library/LaunchAgents/com.neilxu.schoology-sync.plist"
+```
+
+Load and enable it for the current graphical user:
+
+```bash
+launchctl bootstrap "gui/$(id -u)" \
+  "/Users/lingyunxu/Library/LaunchAgents/com.neilxu.schoology-sync.plist"
+launchctl enable "gui/$(id -u)/com.neilxu.schoology-sync"
+```
+
+After changing the plist, unload and reload it so launchd sees the changes:
+
+```bash
+launchctl bootout "gui/$(id -u)" \
+  "/Users/lingyunxu/Library/LaunchAgents/com.neilxu.schoology-sync.plist"
+launchctl bootstrap "gui/$(id -u)" \
+  "/Users/lingyunxu/Library/LaunchAgents/com.neilxu.schoology-sync.plist"
+```
+
+### 5. Check that the job is properly scheduled
+
+First confirm that launchd has loaded the expected service:
+
+```bash
+launchctl print "gui/$(id -u)/com.neilxu.schoology-sync"
+```
+
+A successful result displays the label, program arguments, working directory,
+calendar trigger, run count, process state, and last exit status. If launchd
+prints `Could not find service`, the job is not loaded in that user's GUI
+domain.
+
+Check that the service has not been disabled:
+
+```bash
+launchctl print-disabled "gui/$(id -u)" | \
+  grep "com.neilxu.schoology-sync"
+```
+
+Confirm the intended calendar values in the installed file:
+
+```bash
+plutil -p \
+  "/Users/lingyunxu/Library/LaunchAgents/com.neilxu.schoology-sync.plist"
+```
+
+To perform an immediate scheduled-environment test, start the loaded job
+manually:
+
+```bash
+launchctl kickstart -k "gui/$(id -u)/com.neilxu.schoology-sync"
+```
+
+This is a real normal run: it contacts Schoology, downloads new files, and may
+send email. Follow the logs in another Terminal window:
+
+```bash
+tail -f \
+  "/Users/lingyunxu/Documents/git_projects/schoology/logs/schoology-sync.out.log" \
+  "/Users/lingyunxu/Documents/git_projects/schoology/logs/schoology-sync.err.log"
+```
+
+After it finishes, run `launchctl print` again and check the last exit status.
+Also confirm that the log timestamp, run summaries, download-state timestamps,
+and expected email notification changed during the test.
+
+To see whether a sync process is currently running:
+
+```bash
+pgrep -fl "run_schoology_all.py|schoology_sync.py"
+```
+
+No output means neither Python script is currently running.
+
+### 6. Check for errors
+
+Inspect the most recent standard error output:
+
+```bash
+tail -n 200 \
+  "/Users/lingyunxu/Documents/git_projects/schoology/logs/schoology-sync.err.log"
+```
+
+Search both logs for common failure indicators:
+
+```bash
+grep -nE "FATAL|ERROR|WARNING|Traceback|HTTP 429" \
+  "/Users/lingyunxu/Documents/git_projects/schoology/logs/schoology-sync.out.log" \
+  "/Users/lingyunxu/Documents/git_projects/schoology/logs/schoology-sync.err.log"
+```
+
+Check launchd's recorded status:
+
+```bash
+launchctl print "gui/$(id -u)/com.neilxu.schoology-sync" | \
+  grep -E "state =|runs =|pid =|last exit code"
+```
+
+Interpret the script's last exit code as follows:
+
+- `0`: both profile syncs and requested email operations succeeded
+- `1`: at least one Schoology profile sync failed
+- `3`: email delivery failed
+- `130`: the process was interrupted
+
+If the plist will not load, first rerun `plutil -lint`. Then inspect recent
+launchd messages:
+
+```bash
+log show --last 1h --style compact \
+  --predicate 'process == "launchd" AND eventMessage CONTAINS "com.neilxu.schoology-sync"'
+```
+
+Common scheduled-only problems include:
+
+- the plist contains a relative, moved, or misspelled path;
+- `.venv` or the Playwright Chromium installation is missing;
+- the job was loaded as another user or as a LaunchDaemon;
+- the Mac has no active logged-in graphical session for headed Chromium;
+- Keychain is locked or the scheduled user cannot access the Gmail entry;
+- macOS privacy permissions block access to Google Drive or other folders;
+- Google Drive is not mounted or has not finished downloading the archive and
+  state directories;
+- Schoology authentication expired and needs an interactive `--manual-qr` run;
+- an email configuration or App Password is missing;
+- the log directory did not exist before the job started.
+
+When troubleshooting, run the exact Program and Arguments from the plist in a
+Terminal as the same user. If the interactive command works but the LaunchAgent
+does not, compare its working directory, GUI session, Keychain access, folder
+permissions, environment, and log output.
+
 ## Complete server migration guide
 
 The safest migration is a controlled cutover: stop the old job, copy the data,
